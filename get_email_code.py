@@ -15,47 +15,42 @@ class EmailVerificationHandler:
         self.session = requests.Session()
         self.emailExtension = Config().get_temp_mail_ext()
 
-    def get_verification_code(self, max_retries=5, retry_interval=60):
+    def get_verification_code(self, max_retries=5, retry_interval=30):
         """
-        获取验证码，带有重试机制。
-
-        Args:
-            max_retries: 最大重试次数。
-            retry_interval: 重试间隔时间（秒）。
-
-        Returns:
-            验证码 (字符串或 None)。
+        Obtém o código de verificação com mecanismo de retry melhorado.
         """
-
         for attempt in range(max_retries):
             try:
-                logging.info(f"尝试获取验证码 (第 {attempt + 1}/{max_retries} 次)...")
+                logging.info(f"Tentativa {attempt + 1}/{max_retries} de obter código...")
 
                 if not self.imap:
+                    logging.info("Usando tempmail.plus para verificação...")
                     verify_code, first_id = self._get_latest_mail_code()
-                    if verify_code is not None and first_id is not None:
+                    if verify_code:
+                        logging.info(f"Código encontrado: {verify_code}")
                         self._cleanup_mail(first_id)
                         return verify_code
+                    logging.warning("Nenhum código encontrado nesta tentativa")
                 else:
+                    logging.info("Usando IMAP para verificação...")
                     verify_code = self._get_mail_code_by_imap()
-                    if verify_code is not None:
+                    if verify_code:
+                        logging.info(f"Código encontrado via IMAP: {verify_code}")
                         return verify_code
+                    logging.warning("Nenhum código encontrado via IMAP")
 
-                if attempt < max_retries - 1:  # 除了最后一次尝试，都等待
-                    logging.warning(f"未获取到验证码，{retry_interval} 秒后重试...")
+                if attempt < max_retries - 1:
+                    logging.info(f"Aguardando {retry_interval} segundos antes da próxima tentativa...")
                     time.sleep(retry_interval)
 
             except Exception as e:
-                logging.error(f"获取验证码失败: {e}")  # 记录更一般的异常
+                logging.error(f"Erro ao obter código: {str(e)}")
                 if attempt < max_retries - 1:
-                    logging.error(f"发生错误，{retry_interval} 秒后重试...")
+                    logging.info(f"Tentando novamente em {retry_interval} segundos...")
                     time.sleep(retry_interval)
-                else:
-                    raise Exception(f"获取验证码失败且已达最大重试次数: {e}") from e
 
-        raise Exception(f"经过 {max_retries} 次尝试后仍未获取到验证码。")
+        raise Exception(f"Não foi possível obter o código após {max_retries} tentativas")
 
-    # 使用imap获取邮件
     def _get_mail_code_by_imap(self, retry = 0):
         if retry > 0:
             time.sleep(3)
@@ -130,39 +125,58 @@ class EmailVerificationHandler:
                     logging.error(f"解码邮件正文失败: {e}")
         return ""
 
-    # 手动输入验证码
     def _get_latest_mail_code(self):
-        # 获取邮件列表
-        mail_list_url = f"https://tempmail.plus/api/mails?email={self.username}{self.emailExtension}&limit=20&epin={self.epin}"
-        mail_list_response = self.session.get(mail_list_url)
-        mail_list_data = mail_list_response.json()
-        time.sleep(0.5)
-        if not mail_list_data.get("result"):
+        """
+        Obtém o código mais recente do tempmail.plus com melhor tratamento de erros.
+        """
+        try:
+            mail_list_url = f"https://tempmail.plus/api/mails?email={self.username}{self.emailExtension}&limit=20&epin={self.epin}"
+            logging.info(f"Consultando emails em: {mail_list_url}")
+
+            mail_list_response = self.session.get(mail_list_url)
+            if mail_list_response.status_code != 200:
+                logging.error(f"Erro na API: Status {mail_list_response.status_code}")
+                return None, None
+
+            mail_list_data = mail_list_response.json()
+            if not mail_list_data.get("result"):
+                logging.warning("Nenhum email encontrado")
+                return None, None
+
+            first_id = mail_list_data.get("first_id")
+            if not first_id:
+                logging.warning("Nenhum ID de email encontrado")
+                return None, None
+
+            mail_detail_url = f"https://tempmail.plus/api/mails/{first_id}?email={self.username}{self.emailExtension}&epin={self.epin}"
+            logging.info("Obtendo detalhes do email...")
+
+            mail_detail_response = self.session.get(mail_detail_url)
+            if mail_detail_response.status_code != 200:
+                logging.error(f"Erro ao obter detalhes: Status {mail_detail_response.status_code}")
+                return None, None
+
+            mail_detail_data = mail_detail_response.json()
+            if not mail_detail_data.get("result"):
+                logging.warning("Nenhum detalhe de email encontrado")
+                return None, None
+
+            mail_text = mail_detail_data.get("text", "")
+            mail_subject = mail_detail_data.get("subject", "")
+            logging.info(f"Email encontrado com assunto: {mail_subject}")
+
+            code_match = re.search(r"\b\d{6}\b", mail_text)
+            if code_match:
+                code = code_match.group()
+                logging.info(f"Código extraído com sucesso: {code}")
+                return code, first_id
+
+            logging.warning("Nenhum código encontrado no corpo do email")
             return None, None
 
-        # 获取最新邮件的ID
-        first_id = mail_list_data.get("first_id")
-        if not first_id:
+        except Exception as e:
+            logging.error(f"Erro ao processar email: {str(e)}")
             return None, None
-
-        # 获取具体邮件内容
-        mail_detail_url = f"https://tempmail.plus/api/mails/{first_id}?email={self.username}{self.emailExtension}&epin={self.epin}"
-        mail_detail_response = self.session.get(mail_detail_url)
-        mail_detail_data = mail_detail_response.json()
-        time.sleep(0.5)
-        if not mail_detail_data.get("result"):
-            return None, None
-
-        # 从邮件文本中提取6位数字验证码
-        mail_text = mail_detail_data.get("text", "")
-        mail_subject = mail_detail_data.get("subject", "")
-        logging.info(f"找到邮件主题: {mail_subject}")
-        # 修改正则表达式，确保 6 位数字不紧跟在字母或域名相关符号后面
-        code_match = re.search(r"(?<![a-zA-Z@.])\b\d{6}\b", mail_text)
-
-        if code_match:
-            return code_match.group(), first_id
-        return None, None
 
     def _cleanup_mail(self, first_id):
         # 构造删除请求的URL和数据
